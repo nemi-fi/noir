@@ -9,6 +9,17 @@ use crate::Location;
 pub struct CallStack(Vec<Location>);
 
 impl CallStack {
+    /// Replaces every location by `f`'s image of it; false (and partly mapped) if some location has none (nemi patch).
+    pub fn try_map_locations(&mut self, f: &mut impl FnMut(Location) -> Option<Location>) -> bool {
+        for location in &mut self.0 {
+            match f(*location) {
+                Some(mapped) => *location = mapped,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Construct a new call stack from a potentially empty list of [Location]s.
     pub fn new(locations: Vec<Location>) -> Self {
         Self(locations)

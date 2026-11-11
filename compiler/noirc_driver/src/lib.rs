@@ -639,7 +639,8 @@ fn compile_contract_inner(
     let mut functions = Vec::new();
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-    for contract_function in &contract.functions {
+    let sharding = ContractFnSharding::from_env();
+    for contract_function in sharding.order(context, &contract.name, &contract.functions) {
         let function_id = contract_function.function_id;
         let is_entry_point = contract_function.is_entry_point;
 
@@ -652,6 +653,13 @@ fn compile_contract_inner(
         if !is_entry_point {
             continue;
         }
+
+        // the claims, cache entries and logs of all the contracts of a workspace share one namespace
+        let key = format!("{}-{name}", contract.name);
+        if !sharding.claim(contract.functions.iter().position(|f| f.function_id == function_id), &key) {
+            continue;
+        }
+        let start = std::time::Instant::now();
 
         let mut options = options.clone();
         if name == "public_dispatch" {
@@ -666,13 +674,14 @@ fn compile_contract_inner(
             }
         }
 
-        let function = match compile_no_check(context, &options, function_id, None, true) {
+        let function = match sharding.compile(context, &options, function_id, &key) {
             Ok(function) => function,
             Err(new_error) => {
                 errors.push(new_error.into());
                 continue;
             }
         };
+        let (function, cache_hit) = function;
         warnings.extend(function.warnings);
         let modifiers = context.def_interner.function_modifiers(&function_id);
         let is_unconstrained = context.def_interner.function_meta(&function_id).is_unconstrained();
@@ -690,6 +699,7 @@ fn compile_contract_inner(
             })
             .collect();
 
+        sharding.log(&key, start.elapsed(), cache_hit);
         functions.push(ContractFunction {
             name,
             hash: function.hash,
@@ -700,6 +710,10 @@ fn compile_contract_inner(
             is_unconstrained,
         });
     }
+
+    // Keep the declaration order whatever order the functions were compiled in.
+    let position = |name: &str| contract.functions.iter().position(|f| context.function_name(&f.function_id) == name);
+    functions.sort_by_key(|function| position(&function.name));
 
     if errors.is_empty() {
         let debug_infos: Vec<_> =
@@ -851,29 +865,7 @@ pub fn compile_no_check(
     cached_program: Option<CompiledProgram>,
     force_compile: bool,
 ) -> Result<CompiledProgram, CompileError> {
-    let force_unconstrained = options.force_brillig || options.minimal_ssa;
-
-    let program = if options.instrument_debug {
-        monomorphize_debug(
-            main_function,
-            &mut context.def_interner,
-            context.file_manager.as_file_map(),
-            &context.debug_instrumenter,
-            context.debug_crate_id,
-            force_unconstrained,
-        )?
-    } else {
-        monomorphize(
-            main_function,
-            &mut context.def_interner,
-            context.file_manager.as_file_map(),
-            force_unconstrained,
-        )?
-    };
-
-    if options.show_monomorphized {
-        println!("{program}");
-    }
+    let program = monomorphize_program(context, options, main_function)?;
 
     // If user has specified that they want to see intermediate steps printed then we should
     // force compilation even if the program hasn't changed.
@@ -898,6 +890,49 @@ pub fn compile_no_check(
         return Ok(cached_program);
     }
 
+    compile_monomorphized(context, options, main_function, program, hash)
+}
+
+/// The first half of [`compile_no_check`]: monomorphization (nemi patch: split out, unchanged).
+fn monomorphize_program(
+    context: &mut Context,
+    options: &CompileOptions,
+    main_function: FuncId,
+) -> Result<noirc_frontend::monomorphization::ast::Program, CompileError> {
+    let force_unconstrained = options.force_brillig || options.minimal_ssa;
+
+    let program = if options.instrument_debug {
+        monomorphize_debug(
+            main_function,
+            &mut context.def_interner,
+            context.file_manager.as_file_map(),
+            &context.debug_instrumenter,
+            context.debug_crate_id,
+            force_unconstrained,
+        )?
+    } else {
+        monomorphize(
+            main_function,
+            &mut context.def_interner,
+            context.file_manager.as_file_map(),
+            force_unconstrained,
+        )?
+    };
+
+    if options.show_monomorphized {
+        println!("{program}");
+    }
+    Ok(program)
+}
+
+/// The second half of [`compile_no_check`]: SSA, ACIR and Brillig generation (nemi patch: split out, unchanged).
+fn compile_monomorphized(
+    context: &Context,
+    options: &CompileOptions,
+    main_function: FuncId,
+    program: noirc_frontend::monomorphization::ast::Program,
+    hash: u64,
+) -> Result<CompiledProgram, CompileError> {
     let return_visibility = program.return_visibility();
     let mut ssa_evaluator_options = options.as_ssa_options(context.package_build_path.clone());
 
@@ -935,6 +970,242 @@ pub fn compile_no_check(
         noir_version: NOIR_ARTIFACT_VERSION_STRING.to_string(),
         warnings,
     })
+}
+
+/// Lets several nargo processes share the compilation of one contract's functions (nemi patch).
+///
+/// With `NARGO_CONTRACT_FN_CLAIM_DIR` set, a process compiles a function only after claiming it, by creating
+/// `<dir>/<contract name>-<function name>` (which holds the function's declaration index). A claim fails if another process made it
+/// first, so each process that runs on the same directory compiles a disjoint subset of the functions and writes a
+/// partial artifact (use a separate `--target-dir` for each). Merged in declaration order, the partial artifacts are
+/// the artifact a single process would produce: each function is compiled independently of the others.
+///
+/// With `NARGO_CONTRACT_FN_CACHE_DIR` set, the last compiled programs of each function are kept in
+/// `<dir>/<contract name>-<function name>/<hash>.json` and reused when the function's monomorphized program has the same hash, as nargo
+/// already does for binary packages. The hash covers the whole monomorphized program, source locations included, so a
+/// reused function is exactly what compiling it again would produce. The directory must be specific to the compiler
+/// version and flags: they are not part of the hash.
+///
+/// `NARGO_CONTRACT_FN_ORDER` (comma-separated names) sets the order in which functions are tried, e.g. slowest first,
+/// so the long ones do not end up running last on their own. `NARGO_CONTRACT_FN_LOG` prints the time per function.
+struct ContractFnSharding {
+    claim_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    order: Vec<String>,
+    log: bool,
+}
+
+impl ContractFnSharding {
+    fn from_env() -> Self {
+        let claim_dir = std::env::var_os("NARGO_CONTRACT_FN_CLAIM_DIR").map(PathBuf::from);
+        let order = std::env::var("NARGO_CONTRACT_FN_ORDER")
+            .map(|order| order.split(',').map(|name| name.trim().to_string()).collect())
+            .unwrap_or_default();
+        let log = std::env::var_os("NARGO_CONTRACT_FN_LOG").is_some();
+        let cache_dir = std::env::var_os("NARGO_CONTRACT_FN_CACHE_DIR").map(PathBuf::from);
+        Self { claim_dir, cache_dir, order, log }
+    }
+
+    /// The functions in the order to try them: those named in `NARGO_CONTRACT_FN_ORDER` first, in that order, then
+    /// the others in declaration order.
+    fn order<'a>(
+        &self,
+        context: &Context,
+        contract_name: &str,
+        functions: &'a [ContractFunctionMeta],
+    ) -> Vec<&'a ContractFunctionMeta> {
+        let mut ordered: Vec<&ContractFunctionMeta> = functions.iter().collect();
+        let rank = |function: &ContractFunctionMeta| {
+            let name = format!("{contract_name}-{}", context.function_name(&function.function_id));
+            self.order.iter().position(|n| *n == name).unwrap_or(usize::MAX)
+        };
+        ordered.sort_by_key(|function| rank(function)); // stable: the rest keep declaration order
+        ordered
+    }
+
+    /// Whether this process should compile the function.
+    fn claim(&self, index: Option<usize>, name: &str) -> bool {
+        let Some(dir) = &self.claim_dir else {
+            return true;
+        };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(name)) {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(index.unwrap_or(usize::MAX).to_string().as_bytes())
+                    .expect("could not write the contract function claim");
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => panic!("could not claim contract function {name}: {error}"),
+        }
+    }
+
+    /// The cache directory of one function: `<hash>.json` for each of its last `CACHE_VERSIONS` compilations.
+    fn cache_path(&self, name: &str) -> Option<PathBuf> {
+        self.cache_dir.as_ref().map(|dir| dir.join(name))
+    }
+
+    /// Compiles the function, or reuses one of its cached compilations: as is if its monomorphized program is
+    /// unchanged, or with its locations moved if the program only differs from a cached one by locations that an edit
+    /// of the source files moved (code after the edit in the same file). Returns how the cache was used.
+    fn compile(
+        &self,
+        context: &mut Context,
+        options: &CompileOptions,
+        function_id: FuncId,
+        name: &str,
+    ) -> Result<(CompiledProgram, Option<&'static str>), CompileError> {
+        let Some(dir) = self.cache_path(name) else {
+            return compile_no_check(context, options, function_id, None, true).map(|p| (p, None));
+        };
+        let read = |path: &std::path::Path| -> Option<CachedFunction> {
+            std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        };
+
+        let program = monomorphize_program(context, options, function_id)?;
+        let hash = rustc_hash::FxBuildHasher.hash_one(&program);
+        let exact = dir.join(format!("{hash:016x}.json"));
+        if let Some(cached) = read(&exact).filter(|cached| cached.program.hash == hash) {
+            touch(&exact);
+            return Ok((cached.program, Some("cached")));
+        }
+        // the most recent compilations, newest first
+        for path in cache_entries(&dir).into_iter().take(CACHE_VERSIONS) {
+            let Some(cached) = read(&path) else {
+                continue;
+            };
+            let shifts = cached.shifts(&context.file_manager);
+            let (old_hash, shifts) =
+                shifts.hash_translated(|| rustc_hash::FxBuildHasher.hash_one(&program));
+            if old_hash != cached.program.hash {
+                continue;
+            }
+            let mut compiled = cached.program;
+            let mut move_location = |location| shifts.untranslate(location);
+            let moved = compiled
+                .debug
+                .iter_mut()
+                .all(|debug| debug.location_tree.try_map_locations(&mut move_location))
+                && compiled.warnings.iter_mut().all(|warning| warning.try_map_locations(&mut move_location));
+            if moved {
+                compiled.hash = hash;
+                compiled.file_map =
+                    filter_relevant_files(&compiled.debug, &context.file_manager, &context.parsed_files);
+                self.store(&dir, &compiled, &context.file_manager);
+                return Ok((compiled, Some("cached, locations moved")));
+            }
+        }
+
+        let compiled = compile_monomorphized(context, options, function_id, program, hash)?;
+        self.store(&dir, &compiled, &context.file_manager);
+        Ok((compiled, None))
+    }
+
+    fn store(&self, dir: &std::path::Path, program: &CompiledProgram, file_manager: &FileManager) {
+        let path = dir.join(format!("{:016x}.json", program.hash));
+        let files = file_manager
+            .as_file_map()
+            .all_file_ids()
+            .filter_map(|id| {
+                let path = file_manager.path(*id)?.to_string_lossy().into_owned();
+                let source = file_manager.fetch_file(*id)?;
+                Some(CachedFile { id: *id, path, hash: rustc_hash::FxBuildHasher.hash_one(source) })
+            })
+            .collect();
+        let entry = CachedFunctionRef { program, files };
+        let write = || -> std::io::Result<()> {
+            std::fs::create_dir_all(path.parent().expect("cache file has a parent"))?;
+            let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+            std::fs::write(&tmp, serde_json::to_vec(&entry).map_err(std::io::Error::other)?)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(error) = write() {
+            eprintln!("warning: could not cache contract function at {}: {error}", path.display());
+        }
+        // keep the last few compilations: one per recently built version of the sources
+        for old in cache_entries(dir).into_iter().skip(CACHE_VERSIONS) {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+
+    fn log(&self, name: &str, elapsed: std::time::Duration, cache_hit: Option<&str>) {
+        if self.log {
+            let cached = cache_hit.map(|how| format!(" ({how})")).unwrap_or_default();
+            eprintln!("[nargo-fn] {name}: {} ms{cached}", elapsed.as_millis());
+        }
+    }
+}
+
+/// Compilations kept per contract function.
+const CACHE_VERSIONS: usize = 4;
+
+/// The `.json` entries of a function's cache directory, most recently used first.
+fn cache_entries(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Marks a cache entry as recently used.
+fn touch(path: &std::path::Path) {
+    if let Ok(file) = std::fs::File::options().append(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// A compiled contract function in the function cache, with the files it was compiled from.
+#[derive(serde::Deserialize)]
+struct CachedFunction {
+    program: CompiledProgram,
+    files: Vec<CachedFile>,
+}
+
+#[derive(serde::Serialize)]
+struct CachedFunctionRef<'a> {
+    program: &'a CompiledProgram,
+    files: Vec<CachedFile>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedFile {
+    id: FileId,
+    path: String,
+    hash: u64,
+}
+
+impl CachedFunction {
+    /// How the source files changed since this function was compiled. A file that kept its id and is unchanged, or
+    /// whose old contents are known (the files in the function's debug info), translates; any other has no
+    /// translation, so the program's locations in it make the cache miss.
+    fn shifts(&self, file_manager: &FileManager) -> noirc_errors::LocationShifts {
+        let mut shifts = noirc_errors::LocationShifts::default();
+        for old in &self.files {
+            let Some(new_id) = file_manager.name_to_id(PathBuf::from(&old.path)) else {
+                continue;
+            };
+            let Some(source) = file_manager.fetch_file(new_id) else {
+                continue;
+            };
+            if new_id != old.id {
+                continue;
+            }
+            let edit = if rustc_hash::FxBuildHasher.hash_one(source) == old.hash {
+                noirc_errors::FileEdit { prefix: source.len() as u32, old_changed: 0, new_changed: 0 }
+            } else if let Some(old_file) = self.program.file_map.get(&old.id) {
+                noirc_errors::FileEdit::between(old_file.source.as_bytes(), source.as_bytes())
+            } else {
+                continue;
+            };
+            shifts.files.insert(new_id, (old.id, edit));
+        }
+        shifts
+    }
 }
 
 /// Specifies a contract function and extra metadata that

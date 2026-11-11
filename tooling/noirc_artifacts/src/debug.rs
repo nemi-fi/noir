@@ -403,6 +403,17 @@ impl LocationTree {
         &self.locations
     }
 
+    /// Replaces every location by `f`'s image of it; false (and partly mapped) if some location has none (nemi patch).
+    pub fn try_map_locations(&mut self, f: &mut impl FnMut(Location) -> Option<Location>) -> bool {
+        for node in &mut self.locations {
+            match f(node.value) {
+                Some(mapped) => node.value = mapped,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// Construct a [`CallStack`] from a [`CallStackId`]
     pub fn get_call_stack(&self, mut call_stack: CallStackId) -> CallStack {
         let mut result = Vec::new();

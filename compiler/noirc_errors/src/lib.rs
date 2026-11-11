@@ -6,7 +6,7 @@ pub mod function_locations;
 mod position;
 pub mod reporter;
 pub use noirc_span::{Span, Spanned};
-pub use position::{Located, Location, Position};
+pub use position::{FileEdit, Located, Location, LocationShifts, Position};
 pub use reporter::{CustomDiagnostic, DiagnosticKind};
 use std::io::Write;
 

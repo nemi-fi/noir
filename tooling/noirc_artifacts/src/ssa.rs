@@ -23,3 +23,18 @@ pub enum InternalBug {
     #[error("Assertion is always false")]
     AssertFailed { call_stack: CallStack, message: Option<String> },
 }
+
+impl SsaReport {
+    /// Replaces every location by `f`'s image of it; false (and partly mapped) if some location has none (nemi patch).
+    pub fn try_map_locations(
+        &mut self,
+        f: &mut impl FnMut(noirc_errors::Location) -> Option<noirc_errors::Location>,
+    ) -> bool {
+        match self {
+            SsaReport::Warning(InternalWarning::ConstantReturn { call_stack })
+            | SsaReport::Bug(InternalBug::IndependentSubgraph { call_stack })
+            | SsaReport::Bug(InternalBug::UncheckedBrilligCall { call_stack })
+            | SsaReport::Bug(InternalBug::AssertFailed { call_stack, .. }) => call_stack.try_map_locations(f),
+        }
+    }
+}

@@ -274,7 +274,12 @@ where
     // Lock manifests if the command needs it.
     let _locks = match cmd.lock_type() {
         LockType::None => None,
-        typ => Some(lock_workspace(&workspace, typ == LockType::Exclusive)?),
+        // nemi patch: processes sharing a contract's functions (`NARGO_CONTRACT_FN_CLAIM_DIR`) each write to their
+        // own `--target-dir`, so they only need a shared lock; an exclusive one would run them one after the other.
+        typ => Some(lock_workspace(
+            &workspace,
+            typ == LockType::Exclusive && std::env::var_os("NARGO_CONTRACT_FN_CLAIM_DIR").is_none(),
+        )?),
     };
     run(cmd, workspace)
 }
