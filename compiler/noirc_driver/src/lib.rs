@@ -972,22 +972,23 @@ fn compile_monomorphized(
     })
 }
 
-/// Lets several nargo processes share the compilation of one contract's functions (nemi patch).
+/// Lets several nargo processes share the compilation of one contract's functions, and caches compiled functions
+/// (nemi patch). `nargo compile` sets this up with `NARGO_CONTRACT_FN_JOBS` (see `compile_cmd.rs`).
 ///
 /// With `NARGO_CONTRACT_FN_CLAIM_DIR` set, a process compiles a function only after claiming it, by creating
-/// `<dir>/<contract name>-<function name>` (which holds the function's declaration index). A claim fails if another process made it
-/// first, so each process that runs on the same directory compiles a disjoint subset of the functions and writes a
-/// partial artifact (use a separate `--target-dir` for each). Merged in declaration order, the partial artifacts are
-/// the artifact a single process would produce: each function is compiled independently of the others.
+/// `<dir>/<contract name>-<function name>`, which holds the function's declaration index (and then the compile time).
+/// A claim fails if another process made it first, so each process that runs on the same directory compiles a disjoint
+/// subset of the functions and writes a partial artifact. Merged in declaration order, the partial artifacts are the
+/// artifact a single process would produce: each function is compiled independently of the others.
 ///
 /// With `NARGO_CONTRACT_FN_CACHE_DIR` set, the last compiled programs of each function are kept in
-/// `<dir>/<contract name>-<function name>/<hash>.json` and reused when the function's monomorphized program has the same hash, as nargo
-/// already does for binary packages. The hash covers the whole monomorphized program, source locations included, so a
-/// reused function is exactly what compiling it again would produce. The directory must be specific to the compiler
-/// version and flags: they are not part of the hash.
+/// `<dir>/<key>/<contract name>-<function name>/<hash>.json`, where the key names the nargo binary and the compile
+/// options. One is reused when the function's monomorphized program has the same hash, as nargo already does for binary
+/// packages: the hash covers the whole program, source locations included, so a reused function is exactly what
+/// compiling it again would produce. It is also reused when the program only differs by locations an edit moved.
 ///
-/// `NARGO_CONTRACT_FN_ORDER` (comma-separated names) sets the order in which functions are tried, e.g. slowest first,
-/// so the long ones do not end up running last on their own. `NARGO_CONTRACT_FN_LOG` prints the time per function.
+/// `NARGO_CONTRACT_FN_ORDER` (comma-separated `<contract name>-<function name>`) sets the order in which functions are
+/// tried, e.g. slowest first. `NARGO_CONTRACT_FN_LOG` prints the time per function.
 struct ContractFnSharding {
     claim_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
@@ -1040,9 +1041,16 @@ impl ContractFnSharding {
         }
     }
 
-    /// The cache directory of one function: `<hash>.json` for each of its last `CACHE_VERSIONS` compilations.
-    fn cache_path(&self, name: &str) -> Option<PathBuf> {
-        self.cache_dir.as_ref().map(|dir| dir.join(name))
+    /// The cache directory of one function: `<hash>.json` for each of its last `CACHE_VERSIONS` compilations. It is
+    /// specific to the nargo binary and the compile options, which the program hash does not cover.
+    fn cache_path(&self, name: &str, options: &CompileOptions) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        let exe = std::env::current_exe().ok();
+        let exe_modified = exe.as_ref().and_then(|exe| exe.metadata().ok()?.modified().ok());
+        let key = rustc_hash::FxBuildHasher.hash_one(format!(
+            "{NOIR_ARTIFACT_VERSION_STRING} {exe:?} {exe_modified:?} {options:?}"
+        ));
+        Some(dir.join(format!("{key:016x}")).join(name))
     }
 
     /// Compiles the function, or reuses one of its cached compilations: as is if its monomorphized program is
@@ -1055,7 +1063,7 @@ impl ContractFnSharding {
         function_id: FuncId,
         name: &str,
     ) -> Result<(CompiledProgram, Option<&'static str>), CompileError> {
-        let Some(dir) = self.cache_path(name) else {
+        let Some(dir) = self.cache_path(name, options) else {
             return compile_no_check(context, options, function_id, None, true).map(|p| (p, None));
         };
         let read = |path: &std::path::Path| -> Option<CachedFunction> {
@@ -1129,6 +1137,14 @@ impl ContractFnSharding {
     }
 
     fn log(&self, name: &str, elapsed: std::time::Duration, cache_hit: Option<&str>) {
+        // the process that started the workers reads the times from the claim files
+        if let Some(dir) = &self.claim_dir {
+            use std::io::Write;
+            let how = if cache_hit.is_some() { "cached" } else { "compiled" };
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(dir.join(name)) {
+                let _ = write!(file, " {} {how}", elapsed.as_millis());
+            }
+        }
         if self.log {
             let cached = cache_hit.map(|how| format!(" ({how})")).unwrap_or_default();
             eprintln!("[nargo-fn] {name}: {} ms{cached}", elapsed.as_millis());

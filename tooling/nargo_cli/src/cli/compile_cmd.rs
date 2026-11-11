@@ -50,7 +50,16 @@ impl WorkspaceCommand for CompileCommand {
     }
 }
 
-pub(crate) fn run(args: CompileCommand, workspace: Workspace) -> Result<(), CliError> {
+pub(crate) fn run(args: CompileCommand, mut workspace: Workspace) -> Result<(), CliError> {
+    // nemi patch: a worker process of a sharded compilation writes to its own target directory
+    if let Some(target) = std::env::var_os(sharded::SHARD_TARGET_ENV) {
+        workspace.target_dir = Some(target.into());
+    }
+    if !args.watch && !args.compile_options.debug_compile_stdin {
+        if let Some(jobs) = sharded::jobs(&workspace) {
+            return sharded::compile(&workspace, jobs);
+        }
+    }
     if args.watch {
         if args.compile_options.debug_compile_stdin {
             return Err(CliError::CantWatchStdin);
@@ -322,4 +331,194 @@ fn save_contract(
         println!("Saved contract artifact to: {}", artifact_path.display());
     }
     Ok(())
+}
+
+/// nemi patch: compiles the workspace's contracts in several nargo processes (see `ContractFnSharding` in
+/// `noirc_driver`), then merges their artifacts into the ones a single process would write.
+///
+/// - `NARGO_CONTRACT_FN_JOBS=<n>` (n > 1): compile with n processes. Only for workspaces whose selected packages are
+///   all contracts (libraries aside); otherwise ignored.
+/// - `NARGO_CONTRACT_FN_CACHE_DIR=<dir>`: the per-function cache, shared by the processes. It also keeps how long each
+///   function took (`fn-times.txt`), to start the slowest first next time.
+mod sharded {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use nargo::workspace::Workspace;
+    use noir_artifact_cli::fs::artifact::save_contract_to_file;
+    use noirc_artifacts::contract::ContractArtifact;
+
+    use crate::errors::CliError;
+
+    pub(super) const SHARD_TARGET_ENV: &str = "NARGO_CONTRACT_FN_SHARD_TARGET";
+    const JOBS_ENV: &str = "NARGO_CONTRACT_FN_JOBS";
+    const CLAIM_DIR_ENV: &str = "NARGO_CONTRACT_FN_CLAIM_DIR";
+    const CACHE_DIR_ENV: &str = "NARGO_CONTRACT_FN_CACHE_DIR";
+    const ORDER_ENV: &str = "NARGO_CONTRACT_FN_ORDER";
+    const TIMES_FILE: &str = "fn-times.txt";
+
+    /// The number of processes to compile with, if this process should start them.
+    pub(super) fn jobs(workspace: &Workspace) -> Option<usize> {
+        if std::env::var_os(CLAIM_DIR_ENV).is_some() {
+            return None; // a worker
+        }
+        let jobs: usize = std::env::var(JOBS_ENV).ok()?.parse().ok()?;
+        let only_contracts = workspace
+            .into_iter()
+            .filter(|package| !package.is_library())
+            .all(|package| package.is_contract());
+        (jobs > 1 && only_contracts).then_some(jobs)
+    }
+
+    fn generic(message: impl std::fmt::Display) -> CliError {
+        CliError::Generic(message.to_string())
+    }
+
+    pub(super) fn compile(workspace: &Workspace, jobs: usize) -> Result<(), CliError> {
+        let target = workspace.target_directory_path();
+        let work = target.join(format!(".shards-{}", std::process::id()));
+        let claims = work.join("claims");
+        std::fs::create_dir_all(&claims).map_err(generic)?;
+        let result = compile_in(jobs, &target, &work, &claims);
+        let _ = std::fs::remove_dir_all(&work);
+        result
+    }
+
+    fn compile_in(
+        jobs: usize,
+        target: &Path,
+        work: &Path,
+        claims: &Path,
+    ) -> Result<(), CliError> {
+        let cache_dir = std::env::var_os(CACHE_DIR_ENV).map(PathBuf::from);
+        let times_path = cache_dir.as_ref().map(|dir| dir.join(TIMES_FILE));
+        let old_times = times_path.as_deref().map(read_times).unwrap_or_default();
+
+        // the slowest functions first, by their last compile time
+        let order = std::env::var(ORDER_ENV).unwrap_or_else(|_| {
+            let mut times: Vec<_> = old_times.iter().collect();
+            times.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            times.into_iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(",")
+        });
+
+        // the workers run this same command, each with its own target directory
+        let exe = std::env::current_exe().map_err(generic)?;
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        let mut children = Vec::new();
+        for i in 0..jobs {
+            let child = Command::new(&exe)
+                .args(&args)
+                .env_remove(JOBS_ENV)
+                .env(CLAIM_DIR_ENV, claims)
+                .env(ORDER_ENV, &order)
+                .env(SHARD_TARGET_ENV, work.join(format!("target-{i}")))
+                .spawn()
+                .map_err(generic)?;
+            children.push(child);
+        }
+        let mut failed = false;
+        for mut child in children {
+            failed |= !child.wait().map_err(generic)?.success();
+        }
+        if failed {
+            return Err(generic("a nargo worker process failed"));
+        }
+
+        // merge the partial artifacts of each contract, functions in declaration order
+        let claimed = read_claims(claims)?;
+        let first = work.join("target-0");
+        let mut artifact_names: Vec<_> = std::fs::read_dir(&first)
+            .map_err(generic)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        artifact_names.sort();
+        for path in artifact_names {
+            let file_name = path.file_name().expect("artifact has a file name").to_owned();
+            let mut merged: Option<ContractArtifact> = None;
+            for i in 0..jobs {
+                let part_path = work.join(format!("target-{i}")).join(&file_name);
+                let bytes = std::fs::read(&part_path).map_err(generic)?;
+                let part: ContractArtifact = serde_json::from_slice(&bytes).map_err(generic)?;
+                match &mut merged {
+                    None => merged = Some(part),
+                    Some(merged) => {
+                        merged.functions.extend(part.functions);
+                        merged.file_map.extend(part.file_map);
+                    }
+                }
+            }
+            let mut merged = merged.expect("at least one worker");
+            let contract = merged.name.clone();
+            let index = |name: &str| claimed.get(&format!("{contract}-{name}")).map(|c| c.index);
+            if merged.functions.iter().any(|f| index(&f.name).is_none()) {
+                return Err(generic(format!("unclaimed function in contract {contract}")));
+            }
+            merged.functions.sort_by_key(|f| index(&f.name));
+            let stem = Path::new(&file_name).file_stem().expect("json file").to_string_lossy();
+            save_contract_to_file(&merged, &stem, target)?;
+        }
+
+        // remember the compile times (a reused function keeps its previous one)
+        let mut times = old_times;
+        let (mut compiled, mut reused) = (0, 0);
+        for (name, claim) in &claimed {
+            match claim.time {
+                Some((ms, false)) => {
+                    times.insert(name.clone(), ms);
+                    compiled += 1;
+                }
+                Some((ms, true)) => {
+                    times.entry(name.clone()).or_insert(ms);
+                    reused += 1;
+                }
+                None => {}
+            }
+        }
+        if let Some(times_path) = times_path {
+            let contents: String = times.iter().map(|(name, ms)| format!("{name} {ms}\n")).collect();
+            let _ = std::fs::create_dir_all(times_path.parent().expect("has a parent"));
+            let _ = std::fs::write(times_path, contents);
+        }
+        eprintln!(
+            "Compiled {compiled} contract functions in {jobs} processes, reused {reused} unchanged ones"
+        );
+        Ok(())
+    }
+
+    struct Claim {
+        index: usize,
+        /// compile time in ms, and whether the function was reused from the cache
+        time: Option<(u64, bool)>,
+    }
+
+    /// The claim files: `<contract>-<function>` holds `<declaration index>`, then ` <ms> <compiled|cached>` once done.
+    fn read_claims(dir: &Path) -> Result<BTreeMap<String, Claim>, CliError> {
+        let mut claims = BTreeMap::new();
+        for entry in std::fs::read_dir(dir).map_err(generic)?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let contents = std::fs::read_to_string(entry.path()).map_err(generic)?;
+            let mut parts = contents.split_whitespace();
+            let index = parts.next().and_then(|p| p.parse().ok()).unwrap_or(usize::MAX);
+            let time = match (parts.next().and_then(|p| p.parse().ok()), parts.next()) {
+                (Some(ms), Some(how)) => Some((ms, how == "cached")),
+                _ => None,
+            };
+            claims.insert(name, Claim { index, time });
+        }
+        Ok(claims)
+    }
+
+    fn read_times(path: &Path) -> BTreeMap<String, u64> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let (name, ms) = line.rsplit_once(' ')?;
+                Some((name.to_string(), ms.parse().ok()?))
+            })
+            .collect()
+    }
 }
